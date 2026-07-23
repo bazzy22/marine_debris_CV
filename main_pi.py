@@ -86,6 +86,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+import rclpy
+from geometry_msgs.msg import Point
+
 import cv2
 import numpy as np
 
@@ -1018,6 +1021,12 @@ def main() -> None:
 
     log.info("Pipeline running. Press 'q' to quit.")
 
+    # --- ROS 2 Initialization ---
+    rclpy.init()
+    ros_node = rclpy.create_node('stereo_vision_node')
+    # Create a publisher on the topic 'trash_position'
+    position_pub = ros_node.create_publisher(Point, 'trash_position', 10)
+
     while not shutdown.is_set():
         ret_l, frame_l = cap_left.read()
         ret_r, frame_r = cap_right.read()
@@ -1037,6 +1046,14 @@ def main() -> None:
                 cx, cy = x + w // 2, y + h // 2
                 dist = get_robust_distance(depth_map, cx, cy, config.patch_size)
                 draw_detection(frame_l, x, y, w, h, conf, dist)
+
+                # ROS 2 Publish if confidence > 90%
+                if conf > 0.90:
+                    msg = Point()
+                    msg.x = float(cx)  # Pixel X coordinate
+                    msg.y = float(cy)  # Pixel Y coordinate
+                    msg.z = float(dist) # Distance in meters
+                    position_pub.publish(msg)
         else:
             # Sparse path: grayscale once, then a cheap local search per object.
             if detections:
@@ -1047,6 +1064,17 @@ def main() -> None:
                     dist = sparse_matcher.estimate_distance(gray_l, gray_r, cx, cy)
                     draw_detection(frame_l, x, y, w, h, conf, dist)
 
+                    # ROS 2 Publish if confidence > 90%
+                    if conf > 0.90:
+                        msg = Point()
+                        msg.x = float(cx)   # Pixel X coordinate
+                        msg.y = float(cy)   # Pixel Y coordinate
+                        msg.z = float(dist) # Distance in meters
+                        position_pub.publish(msg)
+        
+        # Keep the ROS node ticking
+        rclpy.spin_once(ros_node, timeout_sec=0)
+            
         # ── 3. FPS counter ────────────────────────────────────────────────
         fps_counter += 1
         now = time.monotonic()
@@ -1078,6 +1106,11 @@ def main() -> None:
 
     # ── Cleanup ───────────────────────────────────────────────────────────
     log.info("Releasing resources.")
+
+    # --- ROS 2 Cleanup ---
+    ros_node.destroy_node()
+    rclpy.shutdown()
+    
     cap_left.stop()
     cap_right.stop()
     cv2.destroyAllWindows()
