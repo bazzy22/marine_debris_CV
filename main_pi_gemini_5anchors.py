@@ -388,79 +388,70 @@ def synchronize_stereo_cameras(
 # ---------------------------------------------------------------------------
 class SparseBlockMatcher:
     """
-    Computes distance only at requested (x, y) points instead of a dense
-    per-pixel disparity map. This is the default distance-estimation path.
-
-    For each point:
-      1. Take a small template patch from the left (grayscale) image.
-      2. Search a limited horizontal range (plus a small vertical tolerance
-         to absorb imperfect rectification) in the right image using
-         normalized cross-correlation (cv2.matchTemplate, TM_CCOEFF_NORMED).
-      3. The x-offset of the best match is the disparity at that point.
-
-    Cost is roughly `match_patch_size^2 * match_search_range *
-    match_row_tolerance` per point — a few thousand operations — versus
-    `frame_width * frame_height * num_disparities` for dense SGBM across the
-    whole frame. For a handful of detections per frame this is typically an
-    order of magnitude cheaper, which is what makes real-time operation on a
-    Pi 5 CPU practical.
-
-    Accuracy note
-    -------------
-    This assumes the two images are at least roughly row-aligned (the
-    `match_row_tolerance` absorbs small misalignment). For best accuracy,
-    calibrate the pair and rectify frames before calling `estimate_distance`
-    — uncalibrated stereo will still work but distances will be noisier.
+    Optimized sparse matcher tuned for 0.8m to 5.0m depth range.
+    Uses sub-pixel quadratic interpolation for smooth, accurate distances at range.
     """
 
     def __init__(self, config: StereoConfig) -> None:
         self.config = config
+        # Target depth range: 0.8m to ~5m
+        self.min_disparity = 15   # ~5.0 meters
+        self.max_disparity = 180  # ~0.5 meters
+        self.patch_size = 25      # Odd size for clean patch centering
+        self.row_tolerance = 3    # Low tolerance (requires rectified frames)
+        self.min_confidence = 0.5
 
     def estimate_distance(
         self, gray_l: np.ndarray, gray_r: np.ndarray, cx: int, cy: int
     ) -> float:
-        """Return distance in metres at (cx, cy) in the left image, or 0.0
-        if no confident match was found (out of bounds / low texture)."""
-        cfg = self.config
-        half = cfg.match_patch_size // 2
         h, w = gray_l.shape[:2]
+        half = self.patch_size // 2
 
         ty0, ty1 = cy - half, cy + half
         tx0, tx1 = cx - half, cx + half
         if ty0 < 0 or tx0 < 0 or ty1 > h or tx1 > w:
-            return 0.0  # Too close to frame edge for a full patch
+            return 0.0
 
         template = gray_l[ty0:ty1, tx0:tx1]
         if template.size == 0:
             return 0.0
 
-        # Search strip in the right image: same rows (± tolerance), and
-        # columns to the LEFT of cx (positive disparity = right-image match
-        # shifted left relative to the left image, for this camera order).
-        sy0 = max(0, ty0 - cfg.match_row_tolerance)
-        sy1 = min(h, ty1 + cfg.match_row_tolerance)
-        sx0 = max(0, tx0 - cfg.match_search_range)
-        sx1 = min(w, tx1)
+        # Search STRICTLY to the left of cx (x_right <= x_left)
+        sy0 = max(0, ty0 - self.row_tolerance)
+        sy1 = min(h, ty1 + self.row_tolerance)
+        sx0 = max(0, cx - self.max_disparity)
+        sx1 = min(w, cx - self.min_disparity + self.patch_size)
 
-        if sx1 - sx0 < cfg.match_patch_size or sy1 - sy0 < cfg.match_patch_size:
-            return 0.0  # Search strip too small (near frame edge)
+        if (sx1 - sx0) < self.patch_size or (sy1 - sy0) < self.patch_size:
+            return 0.0
 
         strip = gray_r[sy0:sy1, sx0:sx1]
-
         result = cv2.matchTemplate(strip, template, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, max_loc = cv2.minMaxLoc(result)
 
-        if max_val < cfg.match_min_confidence:
-            return 0.0  # Low-texture patch or no real match — don't guess
+        if max_val < self.min_confidence:
+            return 0.0
 
-        match_x_in_strip, _ = max_loc
-        matched_x = sx0 + match_x_in_strip + half  # Centre of matched patch
-        disparity = float(cx - matched_x)
+        match_x, match_y = max_loc
+        matched_x_center = sx0 + match_x + half
+        raw_disparity = float(cx - matched_x_center)
 
-        if disparity <= 0.5:
-            return 0.0  # Degenerate/negative disparity — reject
+        # ── Sub-pixel interpolation (1D parabolic fit) ───────────────────
+        # Fits a parabola around the peak in the horizontal correlation score
+        sub_disparity = raw_disparity
+        if 0 < match_x < (result.shape[1] - 1):
+            v_center = result[match_y, match_x]
+            v_left = result[match_y, match_x - 1]
+            v_right = result[match_y, match_x + 1]
+            denom = 2.0 * (v_left - 2.0 * v_center + v_right)
+            if abs(denom) > 1e-5:
+                delta = (v_left - v_right) / denom
+                sub_disparity -= delta  # Adjust disparity sub-pixel offset
 
-        return (cfg.focal_length * cfg.baseline) / disparity
+        if sub_disparity <= 1.0:
+            return 0.0
+
+        return (self.config.focal_length * self.config.baseline) / sub_disparity
 
 
 # ---------------------------------------------------------------------------
@@ -824,7 +815,7 @@ def draw_detection(
     frame: np.ndarray, x: int, y: int, w: int, h: int, conf: float, distance: float
 ) -> None:
     """Draw a bounding box, centre dot and label onto `frame` in-place."""
-    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
+    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 140, 255), 2)
     cx, cy = x + w // 2, y + h // 2
     cv2.circle(frame, (cx, cy), 3, (0, 255, 0), -1)
 
@@ -833,7 +824,7 @@ def draw_detection(
     label_y = y - 10 if y > 20 else y + h + 15
     cv2.putText(
         frame, label, (x, label_y),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2,
+        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 140, 255), 2,
     )
 
 
@@ -1011,6 +1002,16 @@ def main() -> None:
     # ── Pre-allocate disparity visualisation buffer (dense mode only) ──────
     disp_vis_buf: Optional[np.ndarray] = None
 
+    # ── Load Stereo Calibration ───────────────────────────────────────────
+    log.info("Loading stereo calibration maps from stereo_calib.npz")
+    try:
+        calib = np.load("stereo_calib.npz")
+        map1x, map1y = calib["map1x"], calib["map1y"]
+        map2x, map2y = calib["map2x"], calib["map2y"]
+    except FileNotFoundError:
+        log.error("stereo_calib.npz not found! Ensure it is in the same directory.")
+        sys.exit(1)
+
     # ── FPS tracking ──────────────────────────────────────────────────────
     fps_counter = 0
     fps_display = 0.0
@@ -1026,6 +1027,10 @@ def main() -> None:
             log.info("Stream ended or camera disconnected.")
             break
 
+        # ── Apply Rectification Maps ──────────────────────────────────────
+        frame_l = cv2.remap(frame_l, map1x, map1y, cv2.INTER_LINEAR)
+        frame_r = cv2.remap(frame_r, map2x, map2y, cv2.INTER_LINEAR)
+
         # ── 1. Detect objects first — distance is only computed where needed ──
         detections = detector.detect(frame_l)
 
@@ -1040,13 +1045,44 @@ def main() -> None:
 
         else:
             # Sparse path: grayscale once, then a cheap local search per object.
+            # ── 3. COMPUTE SPARSE DISTANCE (5-Point Grid) ─────────────────────
+            # ── 3. COMPUTE SPARSE DISTANCE (Cross-Pattern Grid) ───────────────────
             if detections:
                 gray_l = cv2.cvtColor(frame_l, cv2.COLOR_BGR2GRAY)
                 gray_r = cv2.cvtColor(frame_r, cv2.COLOR_BGR2GRAY)
                 for x, y, w, h, conf in detections:
                     cx, cy = x + w // 2, y + h // 2
-                    dist = sparse_matcher.estimate_distance(gray_l, gray_r, cx, cy)
-                    draw_detection(frame_l, x, y, w, h, conf, dist)
+                    
+                    # 25% margin to stay well inside the irregular edges of a round bag
+                    mx, my = w // 4, h // 4
+                    
+                    # Define cross grid: Center, Top, Bottom, Left, Right
+                    points = [
+                        (cx, cy),                  # Center
+                        (cx, y + my),              # Top
+                        (cx, y + h - my),          # Bottom
+                        (x + mx, cy),              # Left
+                        (x + w - mx, cy)           # Right
+                    ]
+                    
+                    valid_distances = []
+                    for px, py in points:
+                        d = sparse_matcher.estimate_distance(gray_l, gray_r, px, py)
+                        if d > 0.0:
+                            valid_distances.append(d)
+                            # Mark successful texture locks with a cyan dot
+                            cv2.circle(frame_l, (px, py), 3, (255, 255, 0), -1)
+                        else:
+                            # Mark failed texture locks with a red dot
+                            cv2.circle(frame_l, (px, py), 3, (0, 0, 255), -1)
+                    
+                    # Use the median of successful matches to drop extreme outliers
+                    if valid_distances:
+                        final_dist = float(np.median(valid_distances))
+                    else:
+                        final_dist = 0.0
+                        
+                    draw_detection(frame_l, x, y, w, h, conf, final_dist)
         
             
         # ── 3. FPS counter ────────────────────────────────────────────────
