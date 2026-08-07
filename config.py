@@ -24,7 +24,7 @@ class StereoConfig:
 
     # ── Camera geometry ────────────────────────────────────────────────────
     baseline: float = 0.12         # Inter-camera distance in metres (12 cm rig)
-    focal_length: float = 500.0   # Calibrated focal length in pixels
+    focal_length: float = 1114.0   # Calibrated focal length in pixels
 
     # ── Pi Camera Module 3 capture settings ─────────────────────────────────
     pi_resolution: Tuple[int, int] = (640, 480)   # Lowered from 720p for Pi 5 headroom

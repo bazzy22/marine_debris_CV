@@ -1,35 +1,31 @@
 """
-Stereo Vision Pipeline — Optimized for Edge Deployment
-=======================================================
-Targets: Raspberry Pi 5 (default, lightweight) | NVIDIA Jetson (CUDA, optional dense mode)
+Stereo Vision Pipeline — Edge-Optimized Deployment Architecture
+===============================================================
+Targets: Raspberry Pi 5 (AArch64, VideoCore VII) | NVIDIA Jetson (CUDA)
 
-Lightweight-by-default design (Pi 5 friendly)
------------------------------------------------
-Dense whole-frame stereo matching (StereoSGBM + WLS) is the single most
-expensive thing this pipeline can do — it costs the same whether the frame
-has zero or ten objects in it, and full-frame SGBM+WLS at 720p is heavy for
-a Pi 5 CPU. But the actual requirement here is just "distance to each
-detected object", not a dense per-pixel depth map. So by default this
-pipeline:
-  1. Runs the detector (AprilTag or YOLO) on the LEFT frame only.
-  2. For each detected object, extracts a small patch around its center and
-     searches for the matching patch in the RIGHT frame over a limited
-     disparity range (`SparseBlockMatcher`) — a few thousand pixel
-     comparisons per object instead of millions across the whole frame.
-  3. Converts the resulting per-object disparity to a distance.
+Architectural Overview:
+-----------------------
+This pipeline circumvents the O(W*H) computational bottleneck of dense stereo 
+matching (StereoSGBM + WLS) by employing a "Detect-Then-Range" heuristic. 
+By executing inference solely on the primary (left) optical frame and restricting 
+epipolar search to bounded Regions of Interest (RoIs), spatial complexity is 
+reduced from millions of pixel operations to a localized O(N) subset.
 
-Key improvements over original:
-  - Refactor: Abstracted configuration to external `config.py`
-  - Refactor: Generalized `YoloTrashDetector` to a universal `YoloDetector`
-  - Performance: YOLO runs on a half-resolution copy to cut inference time ~4×
-  - Performance: Default distance path is `SparseBlockMatcher` 
+Key Engineering Paradigms:
+  - Configuration Abstraction: State payload decoupled to external `config.py`.
+  - Asynchronous I/O: Video capture operates in isolated daemons to prevent 
+    blocking the main inference thread, utilizing write-preferring mutex locks.
+  - Memory Management: Avoids heap fragmentation via pre-allocated contiguous 
+    buffers and strictly bounded array slicing.
+  - Sensor Synchronization: Hardware-level ISP locking guarantees photometric 
+    consistency (AE/AWB) across the stereo pair, essential for NCC cost functions.
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
-from math import dist
+import math
 import signal
 import sys
 import threading
@@ -40,14 +36,15 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 
-# Abstracted configuration state payload
+# Abstracted configuration state payload injected at runtime
 import config
 from config import StereoConfig
 
 # ---------------------------------------------------------------------------
-# Logging Configuration
+# Telemetry & Logging Configuration
 # ---------------------------------------------------------------------------
-# Establishes a thread-safe stdout logger for asynchronous execution tracing.
+# Establishes a thread-safe stdout logger for asynchronous execution tracing 
+# and system diagnostics.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -55,26 +52,27 @@ logging.basicConfig(
 )
 log = logging.getLogger("stereo")
 
-
-# Type alias for bounding box schema: (x, y, width, height, confidence)
+# Type alias defining the bounding box tensor schema: (x, y, width, height, confidence)
 BBox = Tuple[int, int, int, int, float]
 
 
 # ---------------------------------------------------------------------------
-# I/O Acquisition Layer
+# I/O Acquisition Layer (V4L2)
 # ---------------------------------------------------------------------------
 class ThreadedVideoGrabber:
     """
     Asynchronous V4L2 video stream handler.
     Decouples I/O blocking operations from the main inference loop. 
     Implements a write-preferring lock to guarantee the inference engine 
-    always receives the most recent frame, dropping stale frames organically.
+    always receives the most recent frame in the hardware buffer, dropping 
+    stale frames organically to minimize latency.
     """
     def __init__(self, source: int | str) -> None:
         self.stream = cv2.VideoCapture(source)
         if not self.stream.isOpened():
             raise RuntimeError(f"Cannot open video source: {source!r}")
 
+        # Thread-safe event for deterministic teardown sequence
         self._stop_event = threading.Event()
         self.lock = threading.Lock()
         self.grabbed = False
@@ -88,6 +86,7 @@ class ThreadedVideoGrabber:
         self.grabbed, self.frame = self.stream.read()
 
     def start(self) -> "ThreadedVideoGrabber":
+        """Spawns the background daemon."""
         t = threading.Thread(target=self._update, daemon=True)
         t.start()
         return self
@@ -104,6 +103,7 @@ class ThreadedVideoGrabber:
                 break
 
             # Mutex lock strictly limits scope to reference assignment
+            # O(1) operation prevents blocking the inference loop
             with self.lock:
                 self.grabbed = grabbed
                 self.frame = frame             
@@ -125,14 +125,19 @@ class ThreadedVideoGrabber:
         return not self._stop_event.is_set()
 
     def stop(self) -> None:
+        """Initiates graceful degradation of the I/O thread."""
         self._stop_event.set()
         self.stream.release()
 
 
+# ---------------------------------------------------------------------------
+# I/O Acquisition Layer (libcamera / DMA)
+# ---------------------------------------------------------------------------
 class PiCamera2Grabber:
     """
     libcamera (Picamera2) integration for native Raspberry Pi CSI pipelines.
     Provides direct memory access (DMA) to ISP frames, bypassing inefficient V4L2 bridging.
+    Crucial for dual-CSI synchronization on Raspberry Pi 5.
     """
     def __init__(
         self,
@@ -151,7 +156,7 @@ class PiCamera2Grabber:
         self.camera_num = camera_num
         self.picam2 = Picamera2(camera_num=camera_num)
 
-        # Configure libcamera pipeline for RGB888 (which maps natively to OpenCV's BGR layout)
+        # Configure libcamera pipeline for RGB888 (maps natively to OpenCV's BGR layout in memory)
         video_config = self.picam2.create_video_configuration(
             main={"size": resolution, "format": "RGB888"},
             controls={"FrameRate": fps},
@@ -170,7 +175,7 @@ class PiCamera2Grabber:
 
     def lock_exposure(self, exposure_time: int, analogue_gain: float,
                        colour_gains: Tuple[float, float]) -> None:
-        """Overrides internal ISP algorithms to force static photometric properties."""
+        """Overrides internal ISP dynamic algorithms to force static photometric properties."""
         self.picam2.set_controls({
             "AeEnable": False,
             "AwbEnable": False,
@@ -180,6 +185,7 @@ class PiCamera2Grabber:
         })
 
     def read_settled_metadata(self) -> dict:
+        """Extracts converged state metadata from the ISP."""
         return self.picam2.capture_metadata()
 
     def start(self) -> "PiCamera2Grabber":
@@ -228,10 +234,10 @@ def synchronize_stereo_cameras(
     cam_left: PiCamera2Grabber, cam_right: PiCamera2Grabber, settle_s: float = 2.0
 ) -> None:
     """
-    Forces photometric consistency across the stereo pair.
-    SGBM and NCC algorithms fail drastically if left/right sensors have differing 
-    exposure or white balance. This function allows the master ISP to converge, 
-    extracts the settled state, and statically locks both sensors to identical values.
+    Forces photometric consistency across the stereo baseline.
+    Correlation algorithms (NCC/SGBM) fail drastically if left/right sensors have 
+    divergent exposure or white balance. This function acts as a master/slave 
+    synchronizer to lock both ISP units to identical radiometric profiles.
     """
     log.info("Letting auto-exposure/AWB settle for %.1fs before locking...", settle_s)
     time.sleep(settle_s)
@@ -250,13 +256,13 @@ def synchronize_stereo_cameras(
 
 
 # ---------------------------------------------------------------------------
-# Sparse Distance Estimation Layer
+# Sparse Distance Estimation Layer (Edge Optimized)
 # ---------------------------------------------------------------------------
 class SparseBlockMatcher:
     """
     Highly optimized, region-of-interest normalized cross-correlation (NCC) matcher.
-    O(N) complexity where N is the number of detected objects, avoiding the O(W*H) 
-    complexity of dense disparity mapping.
+    Calculates localized epipolar disparities. Reduces O(W*H) full-frame matrix 
+    computations to O(N) operations, where N is the number of valid detections.
     """
     def __init__(self, config: StereoConfig) -> None:
         self.config = config
@@ -270,14 +276,14 @@ class SparseBlockMatcher:
         self, gray_l: np.ndarray, gray_r: np.ndarray, cx: int, cy: int
     ) -> float:
         """
-        Executes localized epipolar search. Extracts a template from the left frame
-        and sweeps across the corresponding epipolar line segment in the right frame.
-        Applies parabolic interpolation for sub-pixel disparity resolution.
+        Executes localized epipolar search. Extracts a template tensor from the 
+        left frame and sweeps across the corresponding epipolar line segment in 
+        the right frame. 
         """
         h, w = gray_l.shape[:2]
         half = self.patch_size // 2
 
-        # Define bounds for the reference patch (left frame)
+        # Define bounded tensor slice for the reference patch (left frame)
         ty0, ty1 = cy - half, cy + half
         tx0, tx1 = cx - half, cx + half
         if ty0 < 0 or tx0 < 0 or ty1 > h or tx1 > w:
@@ -287,8 +293,8 @@ class SparseBlockMatcher:
         if template.size == 0:
             return 0.0
 
-        # Define bounded horizontal search space (right frame)
-        # Search constrained strictly leftward to respect epipolar geometry
+        # Define bounded horizontal search space (right frame).
+        # Search constrained strictly leftward to respect epipolar geometry.
         sy0 = max(0, ty0 - self.row_tolerance)
         sy1 = min(h, ty1 + self.row_tolerance)
         sx0 = max(0, cx - self.max_disparity)
@@ -297,7 +303,7 @@ class SparseBlockMatcher:
         if (sx1 - sx0) < self.patch_size or (sy1 - sy0) < self.patch_size:
             return 0.0
 
-        # Execute normalized cross-correlation
+        # Execute SIMD-optimized normalized cross-correlation (NCC)
         strip = gray_r[sy0:sy1, sx0:sx1]
         result = cv2.matchTemplate(strip, template, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, max_loc = cv2.minMaxLoc(result)
@@ -309,7 +315,7 @@ class SparseBlockMatcher:
         matched_x_center = sx0 + match_x + half
         raw_disparity = float(cx - matched_x_center)
 
-        # 1D Parabolic sub-pixel interpolation around the response peak
+        # 1D Parabolic sub-pixel interpolation around the response peak to mitigate integer quantization errors
         sub_disparity = raw_disparity
         if 0 < match_x < (result.shape[1] - 1):
             v_center = result[match_y, match_x]
@@ -331,6 +337,7 @@ class SparseBlockMatcher:
 # Dense Distance Estimation Layer (Opt-In Hardware Accelerated)
 # ---------------------------------------------------------------------------
 class BaseStereoProcessor(ABC):
+    """Abstract interface enforcing uniform contract across heterogeneous compute backends."""
     @abstractmethod
     def compute_depth(
         self, frame_l: np.ndarray, frame_r: np.ndarray
@@ -356,10 +363,7 @@ class CPUStereoProcessor(BaseStereoProcessor):
             speckleRange=2,
         )
         self.right_matcher = cv2.ximgproc.createRightMatcher(self.left_matcher)
-
-        self.wls_filter = cv2.ximgproc.createDisparityWLSFilter(
-            matcher_left=self.left_matcher
-        )
+        self.wls_filter = cv2.ximgproc.createDisparityWLSFilter(matcher_left=self.left_matcher)
         self.wls_filter.setLambda(config.wls_lambda)
         self.wls_filter.setSigmaColor(config.wls_sigma)
 
@@ -374,9 +378,9 @@ class CPUStereoProcessor(BaseStereoProcessor):
 
         filtered = self.wls_filter.filter(disp_l, gray_l, disparity_map_right=disp_r)
 
-        # Normalize WLS integer output to standard disparity units
+        # Normalize WLS integer output to standard sub-pixel disparity units
         disparity = filtered.astype(np.float32) / 16.0
-        disparity[disparity <= 0] = 0.1  
+        disparity[disparity <= 0] = 0.1  # Prevent ZeroDivisionError in triangulation
 
         depth_map = (self.config.focal_length * self.config.baseline) / disparity
         return depth_map, disparity
@@ -385,8 +389,8 @@ class CPUStereoProcessor(BaseStereoProcessor):
 class OpenCLStereoProcessor(BaseStereoProcessor):
     """
     iGPU acceleration using OpenCL Transparent API (T-API).
-    Offloads memory-intensive color conversions to the VideoCore VII GPU (Pi 5),
-    leaving SGBM logic on the CPU.
+    Offloads memory-intensive tensor operations (color-space conversions) to the 
+    VideoCore VII GPU (Pi 5), freeing CPU cycles for the SGBM matcher.
     """
     def __init__(self, config: StereoConfig) -> None:
         if not cv2.ocl.haveOpenCL():
@@ -404,15 +408,11 @@ class OpenCLStereoProcessor(BaseStereoProcessor):
         disp_l = self._cpu.left_matcher.compute(gray_l, gray_r)
         disp_r = self._cpu.right_matcher.compute(gray_r, gray_l)
 
-        filtered = self._cpu.wls_filter.filter(
-            disp_l, gray_l, disparity_map_right=disp_r
-        )
+        filtered = self._cpu.wls_filter.filter(disp_l, gray_l, disparity_map_right=disp_r)
         disparity = filtered.astype(np.float32) / 16.0
         disparity[disparity <= 0] = 0.1
 
-        depth_map = (
-            self._cpu.config.focal_length * self._cpu.config.baseline
-        ) / disparity
+        depth_map = (self._cpu.config.focal_length * self._cpu.config.baseline) / disparity
         return depth_map, disparity
 
 
@@ -421,13 +421,10 @@ class CUDAStereoProcessor(BaseStereoProcessor):
     def __init__(self, config: StereoConfig) -> None:
         if cv2.cuda.getCudaEnabledDeviceCount() == 0:
             raise RuntimeError("No CUDA device found — use a different backend.")
-        # [CUDA Implementation Details Omitted for Brevity]
+        
         self.config = config
         bs = config.block_size
-        log.info(
-            "CUDA device: %s",
-            cv2.cuda.DeviceInfo(cv2.cuda.getDevice()).name(),
-        )
+        log.info("CUDA device: %s", cv2.cuda.DeviceInfo(cv2.cuda.getDevice()).name())
 
         self.cuda_matcher = cv2.cuda.createStereoSGBM(
             minDisparity=config.min_disparity,
@@ -440,7 +437,8 @@ class CUDAStereoProcessor(BaseStereoProcessor):
             speckleWindowSize=100,
             speckleRange=2,
         )
-        # Fallback objects for WLS since ximgproc lacks a native CUDA port
+        
+        # WLS post-processing executes on CPU host (no CUDA impl. in ximgproc)
         cpu_left = cv2.StereoSGBM_create(
             minDisparity=config.min_disparity,
             numDisparities=config.num_disparities,
@@ -462,10 +460,10 @@ class CUDAStereoProcessor(BaseStereoProcessor):
         gpu_l.upload(frame_l)
         gpu_r.upload(frame_r)
 
+        # Execute highly parallelized SIMT operations
         gray_gpu_l = cv2.cuda.cvtColor(gpu_l, cv2.COLOR_BGR2GRAY)
         gray_gpu_r = cv2.cuda.cvtColor(gpu_r, cv2.COLOR_BGR2GRAY)
 
-        # Execute SGBM parallelization on GPU
         disp_gpu = self.cuda_matcher.compute(gray_gpu_l, gray_gpu_r)
         
         # Device-to-host (D2H) transfer for WLS filtration
@@ -485,10 +483,8 @@ class CUDAStereoProcessor(BaseStereoProcessor):
 def create_stereo_processor(
     config: StereoConfig, backend: str = "auto"
 ) -> BaseStereoProcessor:
-    """Hardware prober implementing the Factory pattern for dense matching."""
-    order = (
-        ["cuda", "opencl", "cpu"] if backend == "auto" else [backend]
-    )
+    """Hardware prober implementing the Factory pattern for dense matching backend selection."""
+    order = ["cuda", "opencl", "cpu"] if backend == "auto" else [backend]
 
     for name in order:
         try:
@@ -505,9 +501,9 @@ def create_stereo_processor(
                 log.info("Backend selected: CPU")
                 return proc
         except (RuntimeError, cv2.error) as exc:
-            log.warning("Backend %r not available: %s — trying next.", name, exc)
+            log.warning("Backend %r not available: %s — probing next layer.", name, exc)
 
-    raise RuntimeError("No stereo processor could be initialised.")
+    raise RuntimeError("No stereo processor could be initialized.")
 
 
 # ---------------------------------------------------------------------------
@@ -521,8 +517,8 @@ class BaseDetector(ABC):
 
 class YoloDetector(BaseDetector):
     """
-    Handles neural network inference via Ultralytics YOLO architecture.
-    Auto-detects tensor hardware acceleration (CUDA/MPS) with a CPU fallback.
+    Handles universal neural network inference via Ultralytics YOLOv8 architecture.
+    Auto-detects tensor hardware acceleration (CUDA/MPS) with a CPU fallback mechanism.
     """
     def __init__(
         self,
@@ -537,10 +533,11 @@ class YoloDetector(BaseDetector):
         self.half_res = half_res
 
         self.device = self._pick_device()
-        log.info("YOLO running on device: %s", self.device)
+        log.info("YOLO inference engine mapped to device: %s", self.device)
 
     @staticmethod
     def _pick_device() -> str:
+        """Probes for optimal tensor processing unit."""
         try:
             import torch
             if torch.cuda.is_available():
@@ -555,6 +552,7 @@ class YoloDetector(BaseDetector):
         """
         Executes the forward pass. Downsamples the input tensor when `half_res` 
         is active to significantly reduce MAC operations and latency on embedded CPUs.
+        Non-Maximum Suppression (NMS) is inherently handled by the Ultralytics backend.
         """
         if self.half_res:
             h, w = frame.shape[:2]
@@ -574,7 +572,7 @@ class YoloDetector(BaseDetector):
             for box in r.boxes:
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                 confidence = float(box.conf[0].cpu().numpy())
-                # Re-scale bounding box coordinates to align with native frame resolution
+                # Upscale bounding box vectors to align with native frame resolution
                 detected_boxes.append((
                     int(x1 * scale),
                     int(y1 * scale),
@@ -616,17 +614,17 @@ class AprilTagDetector(BaseDetector):
 
 
 # ---------------------------------------------------------------------------
-# Utility and Execution Logic
+# Core Utilities & Execution Logic
 # ---------------------------------------------------------------------------
 def get_robust_distance(
     depth_map: np.ndarray, cx: int, cy: int, patch_size: int
 ) -> float:
     """
-    Applies spatial median filtering across a patch within the dense depth map.
-    Suppresses transient noise spikes and handles dead-zones (disparity=0) gracefully.
+    Applies spatial median filtering across an N-dimensional patch within the dense map.
+    Suppresses transient noise spikes (glare, reflections) and handles dead-zones gracefully.
     """
     h, w = depth_map.shape
-    half = patch_size >> 1  
+    half = patch_size >> 1  # Bitwise shift for minor optimization
 
     y0, y1 = max(0, cy - half), min(h, cy + half + 1)
     x0, x1 = max(0, cx - half), min(w, cx + half + 1)
@@ -637,18 +635,27 @@ def get_robust_distance(
 
 
 def draw_detection(
-    frame: np.ndarray, x: int, y: int, w: int, h: int, conf: float, distance: float
+    frame: np.ndarray, x: int, y: int, w: int, h: int, conf: float, 
+    z_dist: float, true_range: float, bearing_rad: float
 ) -> None:
+    """Applies overlay telemetry (including kinematics) to the output buffer."""
     cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 140, 255), 2)
     cx, cy = x + w // 2, y + h // 2
     cv2.circle(frame, (cx, cy), 3, (0, 255, 0), -1)
 
-    label = f"Dist: {distance:.2f}m | Conf: {conf * 100:.0f}%"
-    label_y = y - 10 if y > 20 else y + h + 15
-    cv2.putText(
-        frame, label, (x, label_y),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 140, 255), 2,
-    )
+    # Convert bearing to degrees for human readability on the GUI
+    bearing_deg = math.degrees(bearing_rad)
+
+    # Format telemetry strings
+    label1 = f"Z-Dist: {z_dist:.2f}m | Rng: {true_range:.2f}m"
+    label2 = f"Brg: {bearing_deg:.1f} deg | Conf: {conf * 100:.0f}%"
+    
+    # Dynamically shift labels above or below the box to prevent clipping
+    label_y = y - 25 if y > 35 else y + h + 20
+    
+    # Draw two lines of text
+    cv2.putText(frame, label1, (x, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 140, 255), 2)
+    cv2.putText(frame, label2, (x, label_y + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 140, 255), 2)
 
 
 def draw_fps(frame: np.ndarray, fps: float) -> None:
@@ -659,78 +666,71 @@ def draw_fps(frame: np.ndarray, fps: float) -> None:
 
 
 def parse_args() -> argparse.Namespace:
+    """Constructs the CLI parser for dynamic runtime configuration."""
     p = argparse.ArgumentParser(
-        description="Stereo vision pipeline — edge-optimised"
+        description="Stereo vision pipeline — edge-optimised deployment architecture"
     )
     p.add_argument(
         "--mode", choices=["yolo", "apriltag"], default=config.DEFAULT_MODE,
-        help=f"Detection mode (default: {config.DEFAULT_MODE})",
+        help=f"Detection topology (default: {config.DEFAULT_MODE})",
     )
     p.add_argument(
         "--left", default=config.DEFAULT_LEFT_SRC,
         metavar="SRC",
-        help="Left camera source: path to video file, integer device index, "
-             "or 'picamN' (e.g. picam0) when using --picam2",
+        help="Left primary source stream mapping",
     )
     p.add_argument(
         "--right", default=config.DEFAULT_RIGHT_SRC,
         metavar="SRC",
-        help="Right camera source (same format as --left)",
+        help="Right secondary source stream mapping",
     )
     p.add_argument(
         "--picam2", action="store_true",
-        help="Use two Raspberry Pi Camera Module 3 units via Picamera2 "
-             "instead of cv2.VideoCapture. --left/--right are interpreted "
-             "as libcamera camera indices (default 0 and 1).",
+        help="Enable native libcamera (Picamera2) integration for CSI interfaces",
     )
     p.add_argument(
         "--baseline", type=float, default=None,
-        help="Override stereo baseline in metres (default: 0.12 m / 12 cm)",
+        help="Override intrinsic stereo baseline offset (metres)",
     )
     p.add_argument(
         "--focal-length", type=float, default=None,
-        help="Override calibrated focal length in pixels",
+        help="Override intrinsic calibrated focal length vector (pixels)",
     )
     p.add_argument(
         "--resolution", default="640x480", metavar="WxH",
-        help="Pi camera capture resolution (--picam2 only, default: 640x480 — "
-             "lower resolution keeps YOLO/matching cost down on a Pi 5)",
+        help="Hardware capture resolution mapping",
     )
     p.add_argument(
         "--fps", type=int, default=30,
-        help="Pi camera capture FPS (--picam2 only, default: 30)",
+        help="Hardware capture FPS ceiling",
     )
     p.add_argument(
         "--dense-depth", action="store_true",
-        help="Use the old full-frame StereoSGBM+WLS pipeline and show a "
-             "dense disparity visualization window, instead of the default "
-             "lightweight per-detection sparse matcher. Much heavier on a "
-             "Pi 5 — use for debugging/demos, not routine operation.",
+        help="Execute exhaustive O(W*H) full-frame matching (debug/demo only)",
     )
     p.add_argument(
         "--backend", choices=["auto", "cuda", "opencl", "cpu"], default="auto",
-        help="Dense stereo processor backend, only used with --dense-depth "
-             "(default: auto-probe)",
+        help="Dense algorithm execution backend",
     )
     p.add_argument(
         "--model", default=config.DEFAULT_MODEL,
         metavar="PATH",
-        help=f"Path to YOLO .pt weights (default: {config.DEFAULT_MODEL})",
+        help=f"Path to serialized YOLO tensor weights (default: {config.DEFAULT_MODEL})",
     )
     p.add_argument(
         "--no-display", dest="display", action="store_false",
-        help="Disable GUI windows (headless / SSH deployment)",
+        help="Disable GUI subsystem (critical for headless edge deployment)",
     )
     return p.parse_args()
 
 
 # ---------------------------------------------------------------------------
-# Core Execution Engine
+# Main Orchestration Engine
 # ---------------------------------------------------------------------------
 def main() -> None:
     args = parse_args()
 
-    # Hydrate configuration payload
+    # Hydrate configuration payload from external config module
     pipeline_config = StereoConfig(display=args.display)
     if args.baseline is not None:
         pipeline_config.baseline = args.baseline
@@ -741,21 +741,21 @@ def main() -> None:
         w_str, h_str = args.resolution.lower().split("x")
         pipeline_config.pi_resolution = (int(w_str), int(h_str))
     except ValueError:
-        log.warning("Could not parse --resolution %r, using default %s",
+        log.warning("Unrecognized --resolution %r mapping to default %s",
                     args.resolution, pipeline_config.pi_resolution)
     pipeline_config.pi_fps = args.fps
 
-    # Configure graceful teardown hooks mapped to standard UNIX signals
+    # Configure graceful teardown hooks mapped to standard UNIX POSIX signals
     shutdown = threading.Event()
 
     def _handle_signal(signum, _frame):
-        log.info("Signal %d received — shutting down.", signum)
+        log.info("POSIX Signal %d trapped — initiating graceful teardown sequence.", signum)
         shutdown.set()
 
     signal.signal(signal.SIGINT,  _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
-    # Initialize frame acquisition topology
+    # Initialize asynchronous hardware acquisition topology
     if args.picam2:
         def _cam_index(s: str, fallback: int) -> int:
             s = s.strip().lower()
@@ -767,7 +767,7 @@ def main() -> None:
         right_idx = _cam_index(args.right, 1)
 
         log.info(
-            "Opening Pi Camera Module 3 pair: left=camera_num %d, right=camera_num %d "
+            "Initializing Pi Camera Module 3 DMA pair: left_idx=%d, right_idx=%d "
             "(baseline=%.3fm, resolution=%s, fps=%d)",
             left_idx, right_idx, pipeline_config.baseline, pipeline_config.pi_resolution, pipeline_config.pi_fps,
         )
@@ -782,22 +782,20 @@ def main() -> None:
         left_src  = _src(args.left)
         right_src = _src(args.right)
 
-        log.info("Opening left  source: %r", left_src)
-        log.info("Opening right source: %r", right_src)
+        log.info("Initializing left primary stream: %r", left_src)
+        log.info("Initializing right secondary stream: %r", right_src)
         cap_left  = ThreadedVideoGrabber(left_src).start()
         cap_right = ThreadedVideoGrabber(right_src).start()
 
-    # Instantiate logic gates for mapping algorithm hierarchy
+    # Instantiate strategy interfaces for runtime algorithm topology
     sparse_matcher: Optional[SparseBlockMatcher] = None
     stereo: Optional[BaseStereoProcessor] = None
 
     if args.dense_depth:
-        log.info("Dense depth mode enabled (--dense-depth) — this is the "
-                  "heavy path; expect lower FPS on a Pi 5.")
+        log.info("Dense matrix mode activated (--dense-depth) — expect throughput degradation.")
         stereo = create_stereo_processor(pipeline_config, backend=args.backend)
     else:
-        log.info("Using lightweight sparse block matcher (default). "
-                  "Pass --dense-depth for the full dense SGBM+WLS pipeline.")
+        log.info("Sparse topology initialized (default).")
         sparse_matcher = SparseBlockMatcher(pipeline_config)
 
     if args.mode == "yolo":
@@ -808,28 +806,28 @@ def main() -> None:
         )
     else:
         detector = AprilTagDetector()
-    log.info("Detector mode: %s", args.mode)
+    log.info("Inference topology: %s", args.mode)
 
-    # I/O Buffer stabilization delay
+    # I/O Buffer stabilization margin
     time.sleep(1.0)
 
-    # Pre-allocate buffer arrays in contiguous memory to prevent heap fragmentation
+    # Pre-allocate contiguous memory buffers to strictly prevent heap fragmentation
     disp_vis_buf: Optional[np.ndarray] = None
 
-    log.info("Loading stereo calibration maps from stereo_calib.npz")
+    log.info("Mapping intrinsic calibration matrices from stereo_calib.npz")
     try:
         calib = np.load("stereo_calib.npz")
         map1x, map1y = calib["map1x"], calib["map1y"]
         map2x, map2y = calib["map2x"], calib["map2y"]
     except FileNotFoundError:
-        log.error("stereo_calib.npz not found! Ensure it is in the same directory.")
+        log.error("stereo_calib.npz mapping failed! Halting execution.")
         sys.exit(1)
 
     fps_counter = 0
     fps_display = 0.0
     fps_timer   = time.monotonic()
 
-    log.info("Pipeline running. Press 'q' to quit.")
+    log.info("Orchestration engine online. Awaiting data...")
 
     # Main Synchronous Event Loop
     while not shutdown.is_set():
@@ -837,41 +835,48 @@ def main() -> None:
         ret_r, frame_r = cap_right.read()
 
         if not ret_l or not ret_r or frame_l is None or frame_r is None:
-            log.info("Stream ended or camera disconnected.")
+            log.info("Stream exhausted or interface fault detected.")
             break
 
         # Execute un-distortion and epipolar row alignment mapping
         frame_l = cv2.remap(frame_l, map1x, map1y, cv2.INTER_LINEAR)
         frame_r = cv2.remap(frame_r, map2x, map2y, cv2.INTER_LINEAR)
 
-        # Stage 1: Localize Objects
-        detections = detector.detect(frame_l)
+        # Stage 1: Spatial Inference
+        raw_detections = detector.detect(frame_l)
+        
+        # Spatial filtering: Suppress false-positives utilizing bounding tensor constraints
+        detections = []
+        for x, y, w, h, conf in raw_detections:
+            if (w * h) >= pipeline_config.min_object_area:
+                detections.append((x, y, w, h, conf))
 
-        # Stage 2: Depth Estimation
+# Stage 2: Depth Estimation
         if args.dense_depth:
-            # O(W*H) Complexity
+            # O(W*H) Matrix Complexity Pathway
             depth_map, disparity = stereo.compute_depth(frame_l, frame_r)
             for x, y, w, h, conf in detections:
                 cx, cy = x + w // 2, y + h // 2
                 dist = get_robust_distance(depth_map, cx, cy, pipeline_config.patch_size)
-                draw_detection(frame_l, x, y, w, h, conf, dist)
-
+                
+                # Pose Translation (Range & Bearing)
+                true_range = 0.0
+                bearing = 0.0
                 if dist > 0.0:
                     img_h, img_w = frame_l.shape[:2]
                     c_x = img_w / 2.0
                     c_y = img_h / 2.0
                     
                     bearing = math.atan2((cx - c_x), pipeline_config.focal_length)
-                    
                     X = (cx - c_x) * dist / pipeline_config.focal_length
                     Y = (cy - c_y) * dist / pipeline_config.focal_length
                     true_range = math.sqrt(X**2 + Y**2 + dist**2)
+
+                # Draw overlay with newly calculated kinematics
+                draw_detection(frame_l, x, y, w, h, conf, dist, true_range, bearing)
                     
-                    # If you have converted this to a ROS 2 node, construct 
-                    # and publish your AprilTagDetection message right here.
-                # ---------------------------------------------------------
         else:
-            # O(N) Complexity
+            # O(N) Sub-tensor Complexity Pathway
             if detections:
                 # Cache grayscale conversions to prevent redundant matrix operations
                 gray_l = cv2.cvtColor(frame_l, cv2.COLOR_BGR2GRAY)
@@ -882,7 +887,7 @@ def main() -> None:
                     # Establish inner bounding margin (25%) to mitigate border artifacting
                     mx, my = w // 4, h // 4
                     
-                    # 5-point spatial sampling grid
+                    # 5-point spatial sampling cross-grid
                     points = [
                         (cx, cy),                 
                         (cx, y + my),             
@@ -906,44 +911,23 @@ def main() -> None:
                     else:
                         final_dist = 0.0
                         
-                    draw_detection(frame_l, x, y, w, h, conf, final_dist)
-
-                    # RANGE & BEARING CODE  
+                    # Pose Translation (Range & Bearing)
+                    true_range = 0.0
+                    bearing = 0.0
                     if final_dist > 0.0:
                         img_h, img_w = frame_l.shape[:2]
                         c_x = img_w / 2.0
                         c_y = img_h / 2.0
                         
                         bearing = math.atan2((cx - c_x), pipeline_config.focal_length)
-                        
                         X = (cx - c_x) * final_dist / pipeline_config.focal_length
                         Y = (cy - c_y) * final_dist / pipeline_config.focal_length
                         true_range = math.sqrt(X**2 + Y**2 + final_dist**2)
-                    '''
-                        # Construct and Publish the ROS 2 Message
-                        # Only publish if we have a valid distance, satisfying her safety requirement!
-                        msg = AprilTagDetection()
-                        
-                        # Header
-                        msg.header.stamp = node.get_clock().now().to_msg() # Adjust based on your ROS 2 node setup
-                        msg.header.frame_id = "camera_link" # Adjust to match your TF tree
-                        
-                        # Data fields
-                        msg.id = int(conf * 100) # Dummy ID for YOLO, or actual ID for AprilTag mode
-                        msg.range = float(true_range)
-                        msg.bearing = float(bearing)
-                        msg.esp32_millis = 0 # As requested
-                        
-                        # Publish to /apriltag/detections
-                        publisher.publish(msg)
 
-                    else:
-                        # Target lost or distance is 0.0. 
-                        # Do absolutely nothing here. Do not publish.
-                        # The node will automatically trigger the safety state after 2 seconds. 
-                        pass
-                    '''
-        # Diagnostics Telemetry
+                    # Draw overlay with newly calculated kinematics
+                    draw_detection(frame_l, x, y, w, h, conf, final_dist, true_range, bearing)
+                    
+        # Diagnostics & Throughput Telemetry
         fps_counter += 1
         now = time.monotonic()
         if now - fps_timer >= 1.0:
@@ -951,7 +935,7 @@ def main() -> None:
             fps_counter = 0
             fps_timer   = now
 
-        # Stage 3: Visual Output Sink
+        # Stage 3: GUI Rendering Pipeline
         if pipeline_config.display:
             draw_fps(frame_l, fps_display)
             cv2.imshow("Stereo Vision — Stream", frame_l)
@@ -962,7 +946,7 @@ def main() -> None:
                 )
                 if disp_vis_buf is None or disp_vis_buf.shape != disp_norm.shape:
                     disp_vis_buf = np.empty_like(disp_norm, dtype=np.uint8)
-                # Unsafe cast avoids redundant object initialization overhead
+                # Unsafe cast bypasses redundant object initialization overhead
                 np.copyto(disp_vis_buf, disp_norm, casting="unsafe")
                 cv2.imshow(
                     "WLS Filtered Disparity",
@@ -972,8 +956,8 @@ def main() -> None:
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
-    # Resource Teardown
-    log.info("Releasing resources.")
+    # Resource Teardown & Buffer De-allocation
+    log.info("Initiating resource de-allocation.")
     
     cap_left.stop()
     cap_right.stop()

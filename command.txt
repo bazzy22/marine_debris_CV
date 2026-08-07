@@ -1,1 +1,0 @@
-python3 main_pi.py --picam2 --mode apriltag
