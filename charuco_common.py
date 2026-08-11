@@ -62,7 +62,7 @@ class CharucoSetup:
     """Wraps board creation + per-frame detection across OpenCV API versions."""
 
     def __init__(self, squares_x, squares_y, square_length, marker_length,
-                 dict_name="DICT_4X4_50", legacy_pattern=True):
+                 dict_name="DICT_4X4_50", legacy_pattern=True, force_legacy_interp=False):
         require_aruco()
         self.squares_x = squares_x
         self.squares_y = squares_y
@@ -72,8 +72,20 @@ class CharucoSetup:
         dict_id = getattr(cv2.aruco, dict_name)
         self.dictionary = cv2.aruco.getPredefinedDictionary(dict_id)
 
-        self._new_api = hasattr(cv2.aruco, "CharucoBoard") and hasattr(cv2.aruco, "CharucoDetector")
-        if self._new_api:
+        has_new_board_api = hasattr(cv2.aruco, "CharucoBoard") and hasattr(cv2.aruco, "CharucoDetector")
+        has_legacy_interp = hasattr(cv2.aruco, "interpolateCornersCharuco")
+
+        # force_legacy_interp: newer OpenCV's class-based CharucoDetector.
+        # detectBoard() has multiple confirmed upstream bugs (GitHub
+        # opencv/opencv #23517, #25850, #25882, #26165) where markers are
+        # found fine but charuco corner interpolation silently returns
+        # nothing. The older free-function detectMarkers() +
+        # interpolateCornersCharuco() path is more battle-tested and still
+        # works fine even with a board built via the new CharucoBoard class,
+        # so we prefer it when available.
+        self._new_api = has_new_board_api and not (force_legacy_interp and has_legacy_interp)
+
+        if has_new_board_api:
             self.board = cv2.aruco.CharucoBoard(
                 (squares_x, squares_y), square_length, marker_length, self.dictionary
             )
@@ -84,13 +96,16 @@ class CharucoSetup:
                 self.board.setLegacyPattern(legacy_pattern)
             except AttributeError:
                 pass
-            det_params = cv2.aruco.DetectorParameters()
-            charuco_params = cv2.aruco.CharucoParameters()
-            self.detector = cv2.aruco.CharucoDetector(self.board, charuco_params, det_params)
         else:
             self.board = cv2.aruco.CharucoBoard_create(
                 squares_x, squares_y, square_length, marker_length, self.dictionary
             )
+
+        if self._new_api:
+            det_params = cv2.aruco.DetectorParameters()
+            charuco_params = cv2.aruco.CharucoParameters()
+            self.detector = cv2.aruco.CharucoDetector(self.board, charuco_params, det_params)
+        else:
             self.detector = None
 
         # 3D position (board coordinate frame) of every possible charuco
@@ -108,6 +123,9 @@ class CharucoSetup:
                 self.detector.detectBoard(gray)
             marker_count = 0 if marker_ids is None else len(marker_ids)
         else:
+            # Works with either an old CharucoBoard_create() board or a
+            # new-style CharucoBoard() instance — interpolateCornersCharuco
+            # just needs a board object with the right interface.
             marker_corners, marker_ids, _ = detect_markers(gray, self.dictionary)
             marker_count = 0 if marker_ids is None else len(marker_ids)
             charuco_corners, charuco_ids = None, None
