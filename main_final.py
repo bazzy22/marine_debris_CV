@@ -57,6 +57,67 @@ BBox = Tuple[int, int, int, int, float]
 
 
 # ---------------------------------------------------------------------------
+# ROS2 Bridge — publishes AprilTagDetection for the BlueBoat VS pipeline
+# ---------------------------------------------------------------------------
+# Interface contract (per blueboat_vs/maneuver_manager_vs.py):
+#   topic:  /apriltag/detections
+#   type:   nautilus_apriltag_msgs/msg/AprilTagDetection
+#     std_msgs/Header header
+#     int32  id              -> actual detected AprilTag ID
+#     float32 range          -> distance to tag, metres, finite, > 0
+#     float32 bearing        -> rad, 0 = centred, positive = tag to the RIGHT
+#     uint32 esp32_millis    -> unused here, always 0
+#
+# Critical behavioural requirement from the downstream integrator: when no
+# tag is currently detected, publish NOTHING — never republish a stale
+# last-known measurement, and never publish a zero/invalid range. The
+# receiving node (maneuver_manager_vs) already treats "no message for >2s"
+# as "tag lost" and drives the vehicle to a safe state on its own.
+class AprilTagRosBridge:
+    """Thin wrapper around a minimal rclpy Node exposing a single publisher.
+
+    Imports rclpy lazily so the rest of this script still runs (e.g. for
+    offline testing / --mode yolo without ROS2) when --ros2 isn't passed
+    and no ROS2 environment is sourced.
+    """
+
+    def __init__(self, topic: str, node_name: str = "stereo_apriltag_bridge") -> None:
+        import rclpy
+        from rclpy.node import Node
+        from nautilus_apriltag_msgs.msg import AprilTagDetection
+
+        self._rclpy = rclpy
+        self._msg_cls = AprilTagDetection
+
+        if not rclpy.ok():
+            rclpy.init(args=None)
+
+        self.node = Node(node_name)
+        self.publisher = self.node.create_publisher(AprilTagDetection, topic, 10)
+        self.node.get_logger().info(f"AprilTag ROS2 bridge publishing on {topic}")
+
+    def publish_detection(
+        self, range_m: float, bearing_rad: float, tag_id: int,
+        frame_id: str = "camera_frame", esp32_millis: int = 0,
+    ) -> None:
+        msg = self._msg_cls()
+        msg.header.stamp = self.node.get_clock().now().to_msg()
+        msg.header.frame_id = frame_id
+        msg.id = int(tag_id)
+        msg.range = float(range_m)
+        msg.bearing = float(bearing_rad)
+        msg.esp32_millis = int(esp32_millis)
+        self.publisher.publish(msg)
+
+    def shutdown(self) -> None:
+        try:
+            self.node.destroy_node()
+        finally:
+            if self._rclpy.ok():
+                self._rclpy.shutdown()
+
+
+# ---------------------------------------------------------------------------
 # I/O Acquisition Layer (V4L2)
 # ---------------------------------------------------------------------------
 class ThreadedVideoGrabber:
@@ -592,16 +653,22 @@ class AprilTagDetector(BaseDetector):
         params = cv2.aruco.DetectorParameters()
         params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_APRILTAG
         self.detector = cv2.aruco.ArucoDetector(self.dictionary, params)
+        # Populated by detect(); parallel to the returned bbox list so
+        # callers can recover which physical AprilTag ID each box came
+        # from (BaseDetector's bbox schema has no room for it).
+        self.last_ids: List[int] = []
 
     def detect(self, frame: np.ndarray) -> List[BBox]:
         if frame is None:
+            self.last_ids = []
             return []
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         corners, ids, _ = self.detector.detectMarkers(gray)
 
         detected_boxes: List[BBox] = []
+        self.last_ids = []
         if ids is not None:
-            for c in corners:
+            for c, tag_id in zip(corners, ids.flatten()):
                 pts = c[0]
                 x1, x2 = float(np.min(pts[:, 0])), float(np.max(pts[:, 0]))
                 y1, y2 = float(np.min(pts[:, 1])), float(np.max(pts[:, 1]))
@@ -610,6 +677,7 @@ class AprilTagDetector(BaseDetector):
                     int(x2 - x1), int(y2 - y1),
                     1.0,
                 ))
+                self.last_ids.append(int(tag_id))
         return detected_boxes
 
 
@@ -721,6 +789,19 @@ def parse_args() -> argparse.Namespace:
         "--no-display", dest="display", action="store_false",
         help="Disable GUI subsystem (critical for headless edge deployment)",
     )
+    p.add_argument(
+        "--ros2", action="store_true",
+        help="Publish detections as nautilus_apriltag_msgs/AprilTagDetection "
+             "for the BlueBoat VS pipeline (requires a sourced ROS2 environment)",
+    )
+    p.add_argument(
+        "--ros2-topic", default="/apriltag/detections",
+        help="Topic to publish AprilTagDetection messages on",
+    )
+    p.add_argument(
+        "--camera-frame", default="camera_frame",
+        help="frame_id to stamp on published detection headers",
+    )
     return p.parse_args()
 
 
@@ -808,6 +889,19 @@ def main() -> None:
         detector = AprilTagDetector()
     log.info("Inference topology: %s", args.mode)
 
+    ros_bridge: Optional[AprilTagRosBridge] = None
+    if args.ros2:
+        try:
+            ros_bridge = AprilTagRosBridge(topic=args.ros2_topic)
+        except Exception:
+            log.exception(
+                "Failed to initialize ROS2 bridge — is the ROS2 environment "
+                "sourced (e.g. 'source /opt/ros/<distro>/setup.bash') and is "
+                "nautilus_apriltag_msgs built/on your PYTHONPATH? Continuing "
+                "WITHOUT publishing to ROS2."
+            )
+            ros_bridge = None
+
     # I/O Buffer stabilization margin
     time.sleep(1.0)
 
@@ -852,19 +946,21 @@ def main() -> None:
 
         # Stage 1: Spatial Inference
         raw_detections = detector.detect(frame_l)
-        
+        raw_ids = getattr(detector, "last_ids", None)  # only meaningful for AprilTagDetector
+
         # Spatial filtering: Suppress false-positives utilizing bounding tensor constraints
         detections = []
-        for x, y, w, h, conf in raw_detections:
+        for i, (x, y, w, h, conf) in enumerate(raw_detections):
             if (w * h) >= pipeline_config.min_object_area:
-                detections.append((x, y, w, h, conf))
+                tag_id = raw_ids[i] if raw_ids is not None and i < len(raw_ids) else -1
+                detections.append((x, y, w, h, conf, tag_id))
 
 # Stage 2: Depth Estimation
         frame_results = []  # collected for rate-limited logging below
         if args.dense_depth:
             # O(W*H) Matrix Complexity Pathway
             depth_map, disparity = stereo.compute_depth(frame_l, frame_r)
-            for x, y, w, h, conf in detections:
+            for x, y, w, h, conf, tag_id in detections:
                 cx, cy = x + w // 2, y + h // 2
                 dist = get_robust_distance(depth_map, cx, cy, pipeline_config.patch_size)
                 
@@ -884,7 +980,7 @@ def main() -> None:
                 # Draw overlay with newly calculated kinematics
                 draw_detection(frame_l, x, y, w, h, conf, dist, true_range, bearing)
                 frame_results.append(dict(x=cx, y=cy, dist=dist, true_range=true_range,
-                                           bearing=bearing, conf=conf))
+                                           bearing=bearing, conf=conf, tag_id=tag_id))
 
         else:
             # O(N) Sub-tensor Complexity Pathway
@@ -892,7 +988,7 @@ def main() -> None:
                 # Cache grayscale conversions to prevent redundant matrix operations
                 gray_l = cv2.cvtColor(frame_l, cv2.COLOR_BGR2GRAY)
                 gray_r = cv2.cvtColor(frame_r, cv2.COLOR_BGR2GRAY)
-                for x, y, w, h, conf in detections:
+                for x, y, w, h, conf, tag_id in detections:
                     cx, cy = x + w // 2, y + h // 2
                     
                     # Establish inner bounding margin (25%) to mitigate border artifacting
@@ -938,7 +1034,7 @@ def main() -> None:
                     # Draw overlay with newly calculated kinematics
                     draw_detection(frame_l, x, y, w, h, conf, final_dist, true_range, bearing)
                     frame_results.append(dict(x=cx, y=cy, dist=final_dist, true_range=true_range,
-                                               bearing=bearing, conf=conf))
+                                               bearing=bearing, conf=conf, tag_id=tag_id))
 
         # Diagnostics & Throughput Telemetry
         fps_counter += 1
@@ -955,12 +1051,38 @@ def main() -> None:
         if frame_results and (now - last_detect_log) >= DETECTION_LOG_INTERVAL_S:
             for i, r in enumerate(frame_results):
                 log.info(
-                    "stereo: object[%d] px=(%d,%d) dist=%.2fm range=%.2fm "
+                    "stereo: object[%d] tag_id=%d px=(%d,%d) dist=%.2fm range=%.2fm "
                     "bearing=%.1fdeg conf=%.2f",
-                    i, r["x"], r["y"], r["dist"], r["true_range"],
+                    i, r["tag_id"], r["x"], r["y"], r["dist"], r["true_range"],
                     math.degrees(r["bearing"]), r["conf"],
                 )
             last_detect_log = now
+
+        # ROS2 publish — BlueBoat VS interface (/apriltag/detections).
+        # Pick the single closest VALID detection as "the" target for this
+        # frame; downstream (maneuver_manager_vs) tracks one target at a
+        # time and has no concept of multiple simultaneous tags. Publish
+        # nothing at all when there's no valid detection this frame — per
+        # spec, never republish a stale reading or a zero/invalid range.
+        if ros_bridge is not None:
+            valid_results = [
+                r for r in frame_results
+                if r["true_range"] > 0.0 and math.isfinite(r["true_range"])
+                and math.isfinite(r["bearing"])
+            ]
+            if valid_results:
+                target = min(valid_results, key=lambda r: r["true_range"])
+                try:
+                    ros_bridge.publish_detection(
+                        range_m=target["true_range"],
+                        bearing_rad=target["bearing"],
+                        tag_id=target["tag_id"],
+                        frame_id=args.camera_frame,
+                        esp32_millis=0,
+                    )
+                except Exception:
+                    log.exception("Failed to publish AprilTagDetection — dropping this frame's ROS2 message.")
+            # else: no valid detection this frame -> intentionally publish nothing.
 
         # Stage 3: GUI Rendering Pipeline
         if pipeline_config.display:
@@ -989,6 +1111,8 @@ def main() -> None:
     cap_left.stop()
     cap_right.stop()
     cv2.destroyAllWindows()
+    if ros_bridge is not None:
+        ros_bridge.shutdown()
 
 
 if __name__ == "__main__":
