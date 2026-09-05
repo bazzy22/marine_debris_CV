@@ -25,6 +25,15 @@ The pipeline is built from four stages that run in sequence, once per frame:
    AprilTags (used for testing and camera calibration work). Each
    detection is a bounding box; anything smaller than the configured
    minimum area is discarded as noise.
+   - For `--mode apriltag`, the marker dictionary is selectable via
+     `--tag-family` (default `apriltag_36h11`). Real AprilTag families
+     and standard ArUco dictionaries are **not interchangeable** — a
+     physical tag printed from one family will not decode against
+     another, even if the pattern looks visually similar. If unsure
+     which family a physical tag actually is, count its total grid size
+     (cells including the black border): `16h5`/`aruco_4x4` = 6×6,
+     `25h9`/`aruco_5x5` = 7×7, `36h10`/`36h11`/`aruco_6x6` = 8×8,
+     `aruco_7x7` = 9×9.
 
 3. **Distance & bearing.** For each detection, the pipeline estimates how
    far away it is using the two camera views (basic stereo triangulation
@@ -64,6 +73,7 @@ deleted without affecting normal runs.
 | Flag | Values | Description |
 |---|---|---|
 | `--mode` | `yolo`, `apriltag` | Detection engine to use. |
+| `--tag-family` | see note below | Fiducial marker dictionary for `--mode apriltag`. Default: `apriltag_36h11`. Choices: `apriltag_16h5`, `apriltag_25h9`, `apriltag_36h10`, `apriltag_36h11`, `aruco_4x4_50/100/250`, `aruco_5x5_50/100/250`, `aruco_6x6_50/100/250`, `aruco_7x7_50/100/250`. `apriltag_*` and `aruco_*` are separate encodings — not interchangeable, even at the same grid size. |
 | `--left` | path, integer, or `picamN` | Left camera source. Ignored if `--picam2` is set. |
 | `--right` | path, integer, or `picamN` | Right camera source. Ignored if `--picam2` is set. |
 | `--picam2` | flag | Use Raspberry Pi Camera Module 3 sensors directly via `libcamera`. |
@@ -198,6 +208,14 @@ python3 main_final.py --picam2 --baseline 0.1217 --focal-length 959.9 --mode apr
 ```bash
 python3 main_final.py --mode yolo --left 0 --right 1 --dense-depth --backend cuda
 ```
+
+**AprilTag mode with a non-default marker family (e.g. a physical ArUco 7x7 board instead of a real AprilTag):**
+```bash
+python3 main_final.py --picam2 --baseline 0.1217 --focal-length 959.9 --mode apriltag --no-display --tag-family aruco_7x7_50
+```
+If detection still fails, standard ArUco dictionaries come in variant
+sizes (`_50`, `_100`, `_250`) with different marker codebooks — try the
+other variants of the same grid family next.
 
 **Setup run example:**
 ```bash

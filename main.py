@@ -56,6 +56,33 @@ log = logging.getLogger("stereo")
 BBox = Tuple[int, int, int, int, float]
 
 
+# Fiducial marker dictionaries, keyed by a short CLI-friendly name.
+# Grid size (total cells including border) is the fastest way to sanity-check
+# which family a physical tag actually is before trying to decode it:
+#   16h5  -> 6x6      25h9  -> 7x7      36h10 / 36h11 -> 8x8
+#   ArUco 4X4 -> 6x6   5X5 -> 7x7   6X6 -> 8x8   7X7 -> 9x9
+TAG_FAMILIES = {
+    # Real AprilTag families
+    "apriltag_16h5":  cv2.aruco.DICT_APRILTAG_16h5,
+    "apriltag_25h9":  cv2.aruco.DICT_APRILTAG_25h9,
+    "apriltag_36h10": cv2.aruco.DICT_APRILTAG_36h10,
+    "apriltag_36h11": cv2.aruco.DICT_APRILTAG_36h11,   # 8x8 grid — default, matches phone-tested tag
+    # Standard ArUco families (NOT AprilTag — different bit layout/encoding)
+    "aruco_4x4_50":   cv2.aruco.DICT_4X4_50,
+    "aruco_4x4_100":  cv2.aruco.DICT_4X4_100,
+    "aruco_4x4_250":  cv2.aruco.DICT_4X4_250,
+    "aruco_5x5_50":   cv2.aruco.DICT_5X5_50,
+    "aruco_5x5_100":  cv2.aruco.DICT_5X5_100,
+    "aruco_5x5_250":  cv2.aruco.DICT_5X5_250,
+    "aruco_6x6_50":   cv2.aruco.DICT_6X6_50,
+    "aruco_6x6_100":  cv2.aruco.DICT_6X6_100,
+    "aruco_6x6_250":  cv2.aruco.DICT_6X6_250,
+    "aruco_7x7_50":   cv2.aruco.DICT_7X7_50,    # 9x9 grid — likely candidate for the physical board
+    "aruco_7x7_100":  cv2.aruco.DICT_7X7_100,   # 9x9 grid
+    "aruco_7x7_250":  cv2.aruco.DICT_7X7_250,   # 9x9 grid
+}
+
+
 # ---------------------------------------------------------------------------
 # ROS2 Bridge — publishes AprilTagDetection for the BlueBoat VS pipeline
 # ---------------------------------------------------------------------------
@@ -743,6 +770,17 @@ def parse_args() -> argparse.Namespace:
         help=f"Detection topology (default: {config.DEFAULT_MODE})",
     )
     p.add_argument(
+        "--tag-family", choices=sorted(TAG_FAMILIES.keys()), default="apriltag_36h11",
+        help="Fiducial marker dictionary to use with --mode apriltag. "
+             "Real AprilTag families (apriltag_*) and standard ArUco "
+             "dictionaries (aruco_*) are NOT interchangeable — a tag "
+             "printed from one family will not decode against another, "
+             "even if the pattern looks visually similar. If unsure which "
+             "family a physical tag is, check its total grid size "
+             "(cells including the black border): 16h5/aruco_4x4=6x6, "
+             "25h9/aruco_5x5=7x7, 36h10/36h11/aruco_6x6=8x8, aruco_7x7=9x9.",
+    )
+    p.add_argument(
         "--left", default=config.DEFAULT_LEFT_SRC,
         metavar="SRC",
         help="Left primary source stream mapping",
@@ -886,8 +924,8 @@ def main() -> None:
             half_res=pipeline_config.yolo_half_res,
         )
     else:
-        detector = AprilTagDetector()
-    log.info("Inference topology: %s", args.mode)
+        detector = AprilTagDetector(tag_family=TAG_FAMILIES[args.tag_family])
+    log.info("Inference topology: %s (tag family: %s)", args.mode, args.tag_family)
 
     ros_bridge: Optional[AprilTagRosBridge] = None
     if args.ros2:
